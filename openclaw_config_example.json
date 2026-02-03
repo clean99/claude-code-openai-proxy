@@ -1,0 +1,23 @@
+{
+  "models": {
+    "providers": {
+      "claude-code": {
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:18880/v1",
+        "apiKey": "claude-code",
+        "models": [
+          {
+            "id": "claude-code",
+            "name": "Claude Code Proxy (local)",
+            "input": "chat"
+          }
+        ]
+      }
+    },
+    "agents": {
+      "defaults": {
+        "primary": "claude-code|claude-code"
+      }
+    }
+  }
+}
