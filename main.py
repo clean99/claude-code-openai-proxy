@@ -150,6 +150,9 @@ async def chat_completions(
 
     has_tools = request.tools and len(request.tools) > 0
     logger.info(f"Request {request_id}: model={request.model}, messages={len(request.messages)}, stream={request.stream}, tools={has_tools}")
+    if has_tools:
+        tool_names = [t.function.name for t in request.tools]
+        logger.info(f"Request {request_id}: Tool names: {tool_names}")
 
     # Tool calling mode
     if has_tools:
@@ -178,6 +181,8 @@ async def _tool_calling_response(request_id: str, request: ChatCompletionRequest
     content, tool_calls = parse_structured_output(raw_response)
 
     logger.info(f"Request {request_id}: Tool response - content={bool(content)}, tool_calls={len(tool_calls)}")
+    if content and not tool_calls:
+        logger.info(f"Request {request_id}: Text response: {content[:200]}...")
 
     # Build response
     if tool_calls:
