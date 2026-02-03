@@ -5,11 +5,12 @@ from typing import AsyncGenerator, Optional
 
 from config import config
 from models import ChatMessage
+from tool_handler import build_tool_prompt, format_tool_results, get_schema_json
 
 logger = logging.getLogger(__name__)
 
 
-def merge_messages_to_prompt(messages: list[ChatMessage]) -> tuple[str, str]:
+def merge_messages_to_prompt(messages: list[ChatMessage], include_tool_results: bool = False) -> tuple[str, str]:
     """
     Merge chat messages into a single prompt string.
     Returns (system_prompt, user_prompt)
@@ -19,23 +20,38 @@ def merge_messages_to_prompt(messages: list[ChatMessage]) -> tuple[str, str]:
 
     for msg in messages:
         if msg.role == "system":
-            system_parts.append(msg.content)
+            system_parts.append(msg.content or "")
         elif msg.role == "user":
-            conversation_parts.append(f"User: {msg.content}")
+            content = msg.content or ""
+            conversation_parts.append(f"User: {content}")
         elif msg.role == "assistant":
-            conversation_parts.append(f"Assistant: {msg.content}")
+            content = msg.content or ""
+            # Include tool_calls info if present
+            if msg.tool_calls and include_tool_results:
+                tool_calls_text = []
+                for tc in msg.tool_calls:
+                    tc_dict = tc.model_dump() if hasattr(tc, 'model_dump') else tc
+                    func = tc_dict.get("function", {})
+                    tool_calls_text.append(f"Called tool: {func.get('name')} with args: {func.get('arguments')}")
+                if tool_calls_text:
+                    content = content + "\n" + "\n".join(tool_calls_text) if content else "\n".join(tool_calls_text)
+            if content:
+                conversation_parts.append(f"Assistant: {content}")
+        elif msg.role == "tool" and include_tool_results:
+            # Tool result message - will be handled by format_tool_results
+            pass
 
     system_prompt = "\n".join(system_parts) if system_parts else ""
     user_prompt = "\n\n".join(conversation_parts)
 
     # If only user messages without role prefix for single message
     if len(messages) == 1 and messages[0].role == "user":
-        user_prompt = messages[0].content
-    elif len([m for m in messages if m.role != "system"]) == 1:
-        # Single non-system message, use content directly
+        user_prompt = messages[0].content or ""
+    elif len([m for m in messages if m.role not in ("system", "tool")]) == 1:
+        # Single non-system, non-tool message, use content directly
         for msg in messages:
             if msg.role == "user":
-                user_prompt = msg.content
+                user_prompt = msg.content or ""
                 break
 
     return system_prompt, user_prompt
@@ -83,6 +99,91 @@ async def execute_claude_code(
     except Exception as e:
         logger.error(f"Claude Code execution error: {e}")
         yield f"Error executing Claude Code: {str(e)}"
+
+
+async def execute_claude_code_with_tools(
+    messages: list[ChatMessage],
+    tools: list[dict]
+) -> dict:
+    """
+    Execute Claude Code CLI with tool calling support.
+    Uses --json-schema for structured output.
+
+    Returns:
+        Raw JSON response from Claude Code CLI
+    """
+    # Build prompts
+    system_prompt, user_prompt = merge_messages_to_prompt(messages, include_tool_results=True)
+
+    # Add tool prompt to system
+    tool_prompt = build_tool_prompt(tools)
+    system_prompt = (system_prompt + "\n\n" + tool_prompt).strip() if system_prompt else tool_prompt
+
+    # Add tool results if any
+    tool_results_text = format_tool_results([m.model_dump() for m in messages])
+    if tool_results_text:
+        user_prompt = user_prompt + "\n\n" + tool_results_text
+
+    # Build command - use JSON schema for structured output
+    cmd = [
+        config.claude_bin,
+        "-p",
+        "--dangerously-skip-permissions",
+        "--output-format", "json",
+        "--tools", "",  # Disable built-in tools
+        "--json-schema", get_schema_json(),
+        "--max-turns", "3",  # Need at least 2 turns for Claude Code internal processing
+    ]
+
+    # Add system prompt
+    if system_prompt:
+        cmd.extend(["--append-system-prompt", system_prompt])
+
+    # Add user prompt
+    cmd.append(user_prompt)
+
+    logger.info(f"Executing Claude Code (tool mode): {' '.join(cmd[:8])}... [prompt truncated]")
+
+    # Execute
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=config.timeout
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise TimeoutError(f"Claude Code execution timed out after {config.timeout}s")
+
+    if process.returncode != 0:
+        error_msg = stderr.decode() if stderr else "Unknown error"
+        logger.error(f"Claude Code (tool mode) returned non-zero: {error_msg}")
+        if not stdout:
+            raise RuntimeError(f"Claude Code error: {error_msg}")
+
+    output = stdout.decode()
+    logger.debug(f"Claude Code (tool mode) raw output: {output[:500]}...")
+
+    # Parse JSON output
+    try:
+        data = json.loads(output)
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Claude Code JSON output: {e}")
+        # Return a fallback response
+        return {
+            "result": output,
+            "structured_output": {
+                "response_type": "text",
+                "content": output
+            }
+        }
 
 
 async def _execute_blocking(cmd: list[str]) -> str:

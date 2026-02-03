@@ -78,12 +78,24 @@ Claude Code CLI is a powerful AI coding assistant, but it only works in the term
 ### Features
 
 - ✅ OpenAI Chat Completions API compatible
+- ✅ **Tool Calling (Function Calling) support** - Full OpenAI-compatible tool use
 - ✅ Streaming support (Server-Sent Events)
 - ✅ System prompt passthrough
 - ✅ Multi-turn conversation support (via client-side history)
 - ✅ Content blocks format support (for OpenClaw)
 - ✅ macOS LaunchAgent for auto-start
 - ✅ Optional Bearer token authentication
+
+### Why This Over Official `claude-max-api`?
+
+| Feature | This Proxy | claude-max-api |
+|---------|------------|----------------|
+| **Tool Calling** | ✅ Full support | ❌ Not supported |
+| Content Blocks Format | ✅ Supported | ❌ Returns `[object Object]` |
+| Streaming | ✅ Works correctly | ⚠️ Issues reported |
+| OpenClaw Integration | ✅ Tested & verified | ⚠️ Compatibility issues |
+
+**Tool calling is critical** for AI assistants like OpenClaw that need to browse the web, control your screen, read files, and more. Without tool calling, these capabilities don't work.
 
 ### Requirements
 
@@ -171,6 +183,41 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+#### Tool Calling Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:18880/v1", api_key="not-needed")
+
+# Define tools
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }
+    }
+}]
+
+# Request with tools
+response = client.chat.completions.create(
+    model="claude-code",
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    tools=tools
+)
+
+# Check for tool calls
+if response.choices[0].message.tool_calls:
+    for tool_call in response.choices[0].message.tool_calls:
+        print(f"Tool: {tool_call.function.name}")
+        print(f"Args: {tool_call.function.arguments}")
+```
+
 #### OpenClaw Integration
 
 Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
@@ -231,8 +278,7 @@ launchctl kickstart -k gui/$(id -u)/com.claude-code.openai-proxy
 
 - No persistent sessions (each request is stateless)
 - Claude Code CLI must be pre-authenticated
-- No tool use passthrough (Claude Code handles tools internally)
-- Responses include full agentic execution results
+- Tool calling mode does not support streaming (JSON schema requires full output)
 
 ### License
 
@@ -314,12 +360,24 @@ Claude Code CLI 是一个强大的 AI 编程助手，但它只能在终端使用
 ### 功能特性
 
 - ✅ 兼容 OpenAI Chat Completions API
+- ✅ **支持 Tool Calling（函数调用）** - 完全兼容 OpenAI 工具调用格式
 - ✅ 支持流式响应 (Server-Sent Events)
 - ✅ 支持 System Prompt 透传
 - ✅ 支持多轮对话（通过客户端历史记录）
 - ✅ 支持 Content Blocks 格式（OpenClaw 使用）
 - ✅ macOS LaunchAgent 开机自启
 - ✅ 可选的 Bearer Token 认证
+
+### 为什么选择这个而不是官方 `claude-max-api`？
+
+| 特性 | 本代理 | claude-max-api |
+|------|--------|----------------|
+| **Tool Calling** | ✅ 完整支持 | ❌ 不支持 |
+| Content Blocks 格式 | ✅ 支持 | ❌ 返回 `[object Object]` |
+| 流式响应 | ✅ 正常工作 | ⚠️ 有问题 |
+| OpenClaw 集成 | ✅ 已测试验证 | ⚠️ 兼容性问题 |
+
+**Tool calling 至关重要** - OpenClaw 等 AI 助手需要浏览网页、控制屏幕、读取文件等能力。没有 Tool Calling，这些功能都无法使用。
 
 ### 环境要求
 
@@ -407,6 +465,41 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+#### Tool Calling 示例
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:18880/v1", api_key="not-needed")
+
+# 定义工具
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "获取城市天气",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }
+    }
+}]
+
+# 带工具的请求
+response = client.chat.completions.create(
+    model="claude-code",
+    messages=[{"role": "user", "content": "东京天气怎么样？"}],
+    tools=tools
+)
+
+# 检查工具调用
+if response.choices[0].message.tool_calls:
+    for tool_call in response.choices[0].message.tool_calls:
+        print(f"工具: {tool_call.function.name}")
+        print(f"参数: {tool_call.function.arguments}")
+```
+
 #### OpenClaw 集成
 
 在 OpenClaw 配置文件中添加 (`~/.openclaw/openclaw.json`):
@@ -467,8 +560,7 @@ launchctl kickstart -k gui/$(id -u)/com.claude-code.openai-proxy
 
 - 无持久化会话（每个请求独立、无状态）
 - Claude Code CLI 需要预先认证
-- 不支持 Tool Use 透传（Claude Code 内部处理工具调用）
-- 响应包含完整的 Agent 执行结果
+- Tool Calling 模式不支持流式响应（JSON Schema 需要完整输出）
 
 ### 开源协议
 

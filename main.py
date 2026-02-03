@@ -5,6 +5,11 @@ Claude Code OpenAI-Compatible Proxy Server
 This server wraps Claude Code CLI as an OpenAI-compatible API endpoint.
 It exposes /v1/chat/completions and /v1/models endpoints.
 
+Supports:
+- Basic chat completions
+- Streaming responses
+- Tool calling (function calling)
+
 Usage:
     python main.py
 
@@ -22,8 +27,10 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from config import config
@@ -34,12 +41,15 @@ from models import (
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
-    ChatMessage,
+    ResponseMessage,
+    ToolCall,
+    FunctionCall,
     Usage,
     ModelInfo,
     ModelListResponse,
 )
-from claude_executor import execute_claude_code
+from claude_executor import execute_claude_code, execute_claude_code_with_tools
+from tool_handler import parse_structured_output
 
 # Configure logging
 logging.basicConfig(
@@ -51,8 +61,8 @@ logger = logging.getLogger(__name__)
 # Create FastAPI app
 app = FastAPI(
     title="Claude Code OpenAI Proxy",
-    description="OpenAI-compatible API proxy for Claude Code CLI",
-    version="1.0.0",
+    description="OpenAI-compatible API proxy for Claude Code CLI with tool calling support",
+    version="1.1.0",
 )
 
 # Add CORS middleware
@@ -63,11 +73,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-from fastapi import Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 
 
 @app.exception_handler(RequestValidationError)
@@ -105,7 +110,8 @@ async def root():
     return {
         "status": "ok",
         "service": "claude-code-openai-proxy",
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "features": ["chat", "streaming", "tool_calling"],
     }
 
 
@@ -135,16 +141,22 @@ async def chat_completions(
 ):
     """
     Create chat completion (OpenAI-compatible).
-    Wraps Claude Code CLI with full permissions.
+    Supports tool calling when tools are provided.
     """
     if not verify_token(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-    logger.info(f"Request {request_id}: model={request.model}, messages={len(request.messages)}, stream={request.stream}")
-    logger.info(f"Request {request_id} messages: {[m.model_dump() for m in request.messages]}")
+    has_tools = request.tools and len(request.tools) > 0
+    logger.info(f"Request {request_id}: model={request.model}, messages={len(request.messages)}, stream={request.stream}, tools={has_tools}")
 
+    # Tool calling mode
+    if has_tools:
+        logger.info(f"Request {request_id}: Tool calling mode with {len(request.tools)} tools")
+        return await _tool_calling_response(request_id, request)
+
+    # Normal mode
     if request.stream:
         return EventSourceResponse(
             _stream_response(request_id, request),
@@ -152,6 +164,68 @@ async def chat_completions(
         )
     else:
         return await _blocking_response(request_id, request)
+
+
+async def _tool_calling_response(request_id: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
+    """Generate a response with potential tool calls."""
+    # Convert tools to dict format
+    tools_dict = [t.model_dump() for t in request.tools]
+
+    # Execute with tool support
+    raw_response = await execute_claude_code_with_tools(request.messages, tools_dict)
+
+    # Parse structured output
+    content, tool_calls = parse_structured_output(raw_response)
+
+    logger.info(f"Request {request_id}: Tool response - content={bool(content)}, tool_calls={len(tool_calls)}")
+
+    # Build response
+    if tool_calls:
+        # Convert tool_calls to proper format
+        formatted_tool_calls = [
+            ToolCall(
+                id=tc["id"],
+                type=tc["type"],
+                function=FunctionCall(
+                    name=tc["function"]["name"],
+                    arguments=tc["function"]["arguments"]
+                )
+            )
+            for tc in tool_calls
+        ]
+
+        return ChatCompletionResponse(
+            id=request_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ResponseMessage(
+                        role="assistant",
+                        content=content,
+                        tool_calls=formatted_tool_calls,
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=_estimate_usage(request, content or ""),
+        )
+    else:
+        return ChatCompletionResponse(
+            id=request_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ResponseMessage(
+                        role="assistant",
+                        content=content or "",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=_estimate_usage(request, content or ""),
+        )
 
 
 async def _blocking_response(request_id: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -163,28 +237,20 @@ async def _blocking_response(request_id: str, request: ChatCompletionRequest) ->
 
     full_content = "".join(content_parts)
 
-    # Estimate token counts (rough approximation)
-    prompt_tokens = sum(len(m.content.split()) for m in request.messages) * 2
-    completion_tokens = len(full_content.split()) * 2
-
     return ChatCompletionResponse(
         id=request_id,
         model=request.model,
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(
+                message=ResponseMessage(
                     role="assistant",
                     content=full_content,
                 ),
                 finish_reason="stop",
             )
         ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+        usage=_estimate_usage(request, full_content),
     )
 
 
@@ -236,6 +302,22 @@ async def _stream_response(request_id: str, request: ChatCompletionRequest):
     yield {"data": "[DONE]"}
 
 
+def _estimate_usage(request: ChatCompletionRequest, completion: str) -> Usage:
+    """Estimate token usage (rough approximation)."""
+    prompt_tokens = 0
+    for m in request.messages:
+        if m.content:
+            prompt_tokens += len(str(m.content).split()) * 2
+
+    completion_tokens = len(completion.split()) * 2
+
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -243,6 +325,7 @@ if __name__ == "__main__":
     logger.info(f"Claude binary: {config.claude_bin}")
     logger.info(f"Model name: {config.model_name}")
     logger.info(f"Auth required: {bool(config.proxy_token)}")
+    logger.info("Features: chat, streaming, tool_calling")
 
     uvicorn.run(
         app,

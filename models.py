@@ -1,5 +1,5 @@
 from typing import List, Optional, Union, Literal, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import time
 
 
@@ -10,15 +10,57 @@ class ContentBlock(BaseModel):
     image_url: Optional[dict] = None
 
 
+# Tool-related models
+class ToolFunctionParameters(BaseModel):
+    """Parameters schema for a tool function."""
+    type: str = "object"
+    properties: Optional[dict] = None
+    required: Optional[List[str]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class ToolFunction(BaseModel):
+    """Function definition for a tool."""
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict] = None
+
+
+class Tool(BaseModel):
+    """Tool definition in OpenAI format."""
+    type: str = "function"
+    function: ToolFunction
+
+
+class FunctionCall(BaseModel):
+    """Function call in assistant's tool_calls."""
+    name: str
+    arguments: str  # JSON string
+
+
+class ToolCall(BaseModel):
+    """Tool call made by the assistant."""
+    id: str
+    type: str = "function"
+    function: FunctionCall
+
+
 class ChatMessage(BaseModel):
-    """Chat message supporting both string and content blocks format."""
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[Any]]
+    """Chat message supporting string, content blocks, tool calls, and tool results."""
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[Union[str, List[Any]]] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None  # For tool result messages
+    name: Optional[str] = None  # Tool name for tool result messages
 
     @field_validator("content", mode="before")
     @classmethod
     def normalize_content(cls, v):
         """Convert content blocks array to string."""
+        if v is None:
+            return None
         if isinstance(v, str):
             return v
         if isinstance(v, list):
@@ -53,11 +95,21 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     user: Optional[str] = None
+    # Tool calling support
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[str, dict]] = None
+
+
+class ResponseMessage(BaseModel):
+    """Message in completion response, may include tool_calls."""
+    role: str = "assistant"
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionChoice(BaseModel):
     index: int
-    message: ChatMessage
+    message: ResponseMessage
     finish_reason: str = "stop"
 
 
@@ -79,6 +131,7 @@ class ChatCompletionResponse(BaseModel):
 class ChatCompletionChunkDelta(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[dict]] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
