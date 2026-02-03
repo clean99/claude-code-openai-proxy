@@ -157,6 +157,12 @@ async def chat_completions(
     # Tool calling mode
     if has_tools:
         logger.info(f"Request {request_id}: Tool calling mode with {len(request.tools)} tools")
+        if request.stream:
+            # Wrap tool response in SSE format for streaming clients
+            return EventSourceResponse(
+                _tool_calling_stream_response(request_id, request),
+                media_type="text/event-stream",
+            )
         return await _tool_calling_response(request_id, request)
 
     # Normal mode
@@ -231,6 +237,85 @@ async def _tool_calling_response(request_id: str, request: ChatCompletionRequest
             ],
             usage=_estimate_usage(request, content or ""),
         )
+
+
+async def _tool_calling_stream_response(request_id: str, request: ChatCompletionRequest):
+    """Wrap tool calling response in SSE streaming format."""
+    # Get the blocking response first
+    response = await _tool_calling_response(request_id, request)
+
+    # Convert to streaming chunks
+    choice = response.choices[0]
+
+    # Send initial chunk with role
+    initial_chunk = ChatCompletionChunk(
+        id=request_id,
+        model=request.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(role="assistant"),
+                finish_reason=None,
+            )
+        ],
+    )
+    yield {"data": initial_chunk.model_dump_json()}
+
+    # Send content if present
+    if choice.message.content:
+        content_chunk = ChatCompletionChunk(
+            id=request_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChatCompletionChunkDelta(content=choice.message.content),
+                    finish_reason=None,
+                )
+            ],
+        )
+        yield {"data": content_chunk.model_dump_json()}
+
+    # Send tool_calls if present
+    if choice.message.tool_calls:
+        for tc in choice.message.tool_calls:
+            tool_chunk = ChatCompletionChunk(
+                id=request_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[{
+                                "index": 0,
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                }
+                            }]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield {"data": tool_chunk.model_dump_json()}
+
+    # Send final chunk
+    final_chunk = ChatCompletionChunk(
+        id=request_id,
+        model=request.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(),
+                finish_reason=choice.finish_reason,
+            )
+        ],
+    )
+    yield {"data": final_chunk.model_dump_json()}
+    yield {"data": "[DONE]"}
 
 
 async def _blocking_response(request_id: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
